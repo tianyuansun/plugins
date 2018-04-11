@@ -1,4 +1,5 @@
-// Copyright 2015 CNI authors
+// Copyright 2017 CNI authors
+// Copyright 2017 Lyft Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,27 +13,36 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// This is a sample chained plugin that supports multiple CNI versions. It
+// parses prevResult according to the cniVersion
 package main
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
+	"math"
+	"math/rand"
 	"net"
 	"os"
 	"runtime"
+	"sort"
+	"time"
 
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
 	"github.com/containernetworking/cni/pkg/types/current"
 	"github.com/containernetworking/cni/pkg/version"
 	"github.com/containernetworking/plugins/pkg/ip"
-	"github.com/containernetworking/plugins/pkg/ipam"
 	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/containernetworking/plugins/pkg/utils"
+	"github.com/coreos/go-iptables/iptables"
 	"github.com/j-keck/arping"
 	"github.com/vishvananda/netlink"
 )
+
+// constants for full jitter backoff in milliseconds
+const maxSleep = 10000 // 10.00s
+const baseSleep = 20   //  0.02s
 
 func init() {
 	// this ensures that main runs only on main thread (thread group leader).
@@ -41,24 +51,177 @@ func init() {
 	runtime.LockOSThread()
 }
 
-type NetConf struct {
+// PluginConf is whatever you expect your configuration json to be. This is whatever
+// is passed in on stdin. Your plugin may wish to expose its functionality via
+// runtime args, see CONVENTIONS.md in the CNI spec.
+type PluginConf struct {
 	types.NetConf
-	IPMasq bool `json:"ipMasq"`
-	MTU    int  `json:"mtu"`
+
+	// This is the previous result, when called in the context of a chained
+	// plugin. Because this plugin supports multiple versions, we'll have to
+	// parse this in two passes. If your plugin is not chained, this can be
+	// removed (though you may wish to error if a non-chainable plugin is
+	// chained.
+	// If you need to modify the result before returning it, you will need
+	// to actually convert it to a concrete versioned struct.
+	RawPrevResult *map[string]interface{} `json:"prevResult"`
+	PrevResult    *current.Result         `json:"-"`
+
+	IPMasq             bool   `json:"ipMasq"`
+	HostInterface      string `json:"hostInterface"`
+	ContainerInterface string `json:"containerInterface"`
+	MTU                int    `json:"mtu"`
+	TableStart         int    `json:"routeTableStart"`
 }
 
-func setupContainerVeth(netns ns.NetNS, ifName string, mtu int, pr *current.Result) (*current.Interface, *current.Interface, error) {
-	// The IPAM result will be something like IP=192.168.3.5/24, GW=192.168.3.1.
-	// What we want is really a point-to-point link but veth does not support IFF_POINTOPONT.
-	// Next best thing would be to let it ARP but set interface to 192.168.3.5/32 and
-	// add a route like "192.168.3.0/24 via 192.168.3.1 dev $ifName".
-	// Unfortunately that won't work as the GW will be outside the interface's subnet.
+// parseConfig parses the supplied configuration (and prevResult) from stdin.
+func parseConfig(stdin []byte) (*PluginConf, error) {
+	conf := PluginConf{}
 
-	// Our solution is to configure the interface with 192.168.3.5/24, then delete the
-	// "192.168.3.0/24 dev $ifName" route that was automatically added. Then we add
-	// "192.168.3.1/32 dev $ifName" and "192.168.3.0/24 via 192.168.3.1 dev $ifName".
-	// In other words we force all traffic to ARP via the gateway except for GW itself.
+	if err := json.Unmarshal(stdin, &conf); err != nil {
+		return nil, fmt.Errorf("failed to parse network configuration: %v", err)
+	}
 
+	// Parse previous result.
+	if conf.RawPrevResult != nil {
+		resultBytes, err := json.Marshal(conf.RawPrevResult)
+		if err != nil {
+			return nil, fmt.Errorf("could not serialize prevResult: %v", err)
+		}
+		res, err := version.NewResult(conf.CNIVersion, resultBytes)
+		if err != nil {
+			return nil, fmt.Errorf("could not parse prevResult: %v", err)
+		}
+		conf.RawPrevResult = nil
+		conf.PrevResult, err = current.NewResultFromResult(res)
+		if err != nil {
+			return nil, fmt.Errorf("could not convert result to current version: %v", err)
+		}
+	}
+	// End previous result parsing
+
+	if conf.HostInterface == "" {
+		return nil, fmt.Errorf("hostInterface must be specified")
+	}
+
+	if conf.ContainerInterface == "" {
+		return nil, fmt.Errorf("containerInterface must be specified")
+	}
+
+	// start using tables by default at 256
+	if conf.TableStart == 0 {
+		conf.TableStart = 256
+	}
+
+	return &conf, nil
+}
+
+func enableForwarding(ipv4 bool, ipv6 bool) error {
+	if ipv4 {
+		err := ip.EnableIP4Forward()
+		if err != nil {
+			return fmt.Errorf("Could not enable IPv6 forwarding: %v", err)
+		}
+	}
+	if ipv6 {
+		err := ip.EnableIP6Forward()
+		if err != nil {
+			return fmt.Errorf("Could not enable IPv6 forwarding: %v", err)
+		}
+	}
+	return nil
+}
+
+func setupSNAT(ifName string, comment string) error {
+	ipt, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
+	if err != nil {
+		return fmt.Errorf("failed to locate iptables: %v", err)
+	}
+	if err := ipt.AppendUnique("nat", "POSTROUTING", "-o", ifName, "-j", "MASQUERADE", "-m", "comment", "--comment", comment); err != nil {
+		return err
+	}
+	return nil
+}
+
+func findFreeTable(start int) (int, error) {
+	allocatedTableIDs := make(map[int]bool)
+	// combine V4 and V6 tables
+	for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
+		rules, err := netlink.RuleList(family)
+		if err != nil {
+			return -1, err
+		}
+		for _, rule := range rules {
+			allocatedTableIDs[rule.Table] = true
+		}
+	}
+	// find first slot that's available for both V4 and V6 usage
+	for i := start; i < math.MaxUint32; i++ {
+		if !allocatedTableIDs[i] {
+			return i, nil
+		}
+	}
+	return -1, fmt.Errorf("failed to find free route table")
+}
+
+func addPolicyRules(veth *net.Interface, ipc *current.IPConfig, routes []*types.Route, tableStart int) error {
+	table := -1
+
+	// depend on netlink atomicity to win races for table slots on initial route add
+	sort.Slice(routes, func(i, j int) bool {
+		return routes[i].Dst.String() < routes[j].Dst.String()
+	})
+
+	// try 10 times to write to an empty table slot
+	for i := 0; i < 10 && table == -1; i++ {
+		var err error
+		// jitter looking for an initial free table slot
+		table, err = findFreeTable(tableStart + rand.Intn(1000))
+		if err != nil {
+			return err
+		}
+
+		// add routes to the policy routing table
+		for _, route := range routes {
+			err := netlink.RouteAdd(&netlink.Route{
+				LinkIndex: veth.Index,
+				Dst:       &route.Dst,
+				Gw:        ipc.Address.IP,
+				Table:     table,
+			})
+			if err != nil {
+				table = -1
+				break
+			}
+		}
+
+		if table == -1 {
+			// failed to add routes so sleep and try again on a different table
+			wait := time.Duration(rand.Intn(int(math.Min(maxSleep,
+				baseSleep*math.Pow(2, float64(i)))))) * time.Millisecond
+			fmt.Fprintf(os.Stderr, "route table collision, retrying in %v\n", wait)
+			time.Sleep(wait)
+		}
+	}
+
+	// ensure we have a route table selected
+	if table == -1 {
+		return fmt.Errorf("failed to add routes to a free table")
+	}
+
+	// add policy route for traffic originating from a Pod
+	rule := netlink.NewRule()
+	rule.IifName = veth.Name
+	rule.Table = table
+	err := netlink.RuleAdd(rule)
+	if err != nil {
+		return fmt.Errorf("failed to add policy rule %v: %v", rule, err)
+	}
+
+	return nil
+}
+
+func setupContainerVeth(netns ns.NetNS, ifName string, mtu int, hostAddrs []netlink.Addr, masq, containerIPV4, containerIPV6 bool, k8sIfName string, pr *current.Result) (*current.Interface, *current.Interface, error) {
 	hostInterface := &current.Interface{}
 	containerInterface := &current.Interface{}
 
@@ -80,63 +243,57 @@ func setupContainerVeth(netns ns.NetNS, ifName string, mtu int, pr *current.Resu
 
 		pr.Interfaces = []*current.Interface{hostInterface, containerInterface}
 
-		if err = ipam.ConfigureIface(ifName, pr); err != nil {
-			return err
-		}
-
 		contVeth, err := net.InterfaceByName(ifName)
 		if err != nil {
 			return fmt.Errorf("failed to look up %q: %v", ifName, err)
 		}
 
-		for _, ipc := range pr.IPs {
-			// Delete the route that was automatically added
-			route := netlink.Route{
-				LinkIndex: contVeth.Index,
-				Dst: &net.IPNet{
-					IP:   ipc.Address.IP.Mask(ipc.Address.Mask),
-					Mask: ipc.Address.Mask,
-				},
-				Scope: netlink.SCOPE_NOWHERE,
+		if masq {
+			// enable forwarding and SNATing for traffic rerouted from kube-proxy
+			err := enableForwarding(containerIPV4, containerIPV6)
+			if err != nil {
+				return err
 			}
 
-			if err := netlink.RouteDel(&route); err != nil {
-				return fmt.Errorf("failed to delete route %v: %v", route, err)
-			}
-
-			addrBits := 32
-			if ipc.Version == "6" {
-				addrBits = 128
-			}
-
-			for _, r := range []netlink.Route{
-				netlink.Route{
-					LinkIndex: contVeth.Index,
-					Dst: &net.IPNet{
-						IP:   ipc.Gateway,
-						Mask: net.CIDRMask(addrBits, addrBits),
-					},
-					Scope: netlink.SCOPE_LINK,
-					Src:   ipc.Address.IP,
-				},
-				netlink.Route{
-					LinkIndex: contVeth.Index,
-					Dst: &net.IPNet{
-						IP:   ipc.Address.IP.Mask(ipc.Address.Mask),
-						Mask: ipc.Address.Mask,
-					},
-					Scope: netlink.SCOPE_UNIVERSE,
-					Gw:    ipc.Gateway,
-					Src:   ipc.Address.IP,
-				},
-			} {
-				if err := netlink.RouteAdd(&r); err != nil {
-					return fmt.Errorf("failed to add route %v: %v", r, err)
-				}
+			err = setupSNAT(k8sIfName, "kube-proxy SNAT")
+			if err != nil {
+				return fmt.Errorf("failed to enable SNAT on %q: %v", k8sIfName, err)
 			}
 		}
 
-		// Send a gratuitous arp for all v4 addresses
+		// add host routes for each dst hostInterface ip on dev contVeth
+		for _, ipc := range hostAddrs {
+			addrBits := 128
+			if ipc.IP.To4() != nil {
+				addrBits = 32
+			}
+
+			err := netlink.RouteAdd(&netlink.Route{
+				LinkIndex: contVeth.Index,
+				Scope:     netlink.SCOPE_LINK,
+				Dst: &net.IPNet{
+					IP:   ipc.IP,
+					Mask: net.CIDRMask(addrBits, addrBits),
+				},
+			})
+
+			if err != nil {
+				return fmt.Errorf("failed to add host route dst %v: %v", ipc.IP, err)
+			}
+		}
+
+		// add a default gateway pointed at the first hostAddr
+		//err = netlink.RouteAdd(&netlink.Route{
+		//	LinkIndex: contVeth.Index,
+		//	Scope:     netlink.SCOPE_UNIVERSE,
+		//	Dst:       nil,
+		//	Gw:        hostAddrs[0].IP,
+		//})
+		//if err != nil {
+		//	return fmt.Errorf("failed to add default route %v: %v", hostAddrs[0].IP, err)
+		//}
+
+		// Send a gratuitous arp for all borrowed v4 addresses
 		for _, ipc := range pr.IPs {
 			if ipc.Version == "4" {
 				_ = arping.GratuitousArpOverIface(ipc.Address.IP, *contVeth)
@@ -151,64 +308,115 @@ func setupContainerVeth(netns ns.NetNS, ifName string, mtu int, pr *current.Resu
 	return hostInterface, containerInterface, nil
 }
 
-func setupHostVeth(vethName string, result *current.Result) error {
-	// hostVeth moved namespaces and may have a new ifindex
-	veth, err := netlink.LinkByName(vethName)
+func setupHostVeth(vethName string, hostAddrs []netlink.Addr, masq bool, tableStart int, result *current.Result) error {
+	// no IPs to route
+	if len(result.IPs) == 0 {
+		return nil
+	}
+
+	// lookup by name as interface ids might have changed
+	veth, err := net.InterfaceByName(vethName)
 	if err != nil {
 		return fmt.Errorf("failed to lookup %q: %v", vethName, err)
 	}
 
+	// add destination routes to Pod IPs
 	for _, ipc := range result.IPs {
-		maskLen := 128
+		addrBits := 128
 		if ipc.Address.IP.To4() != nil {
-			maskLen = 32
+			addrBits = 32
 		}
 
-		ipn := &net.IPNet{
-			IP:   ipc.Gateway,
-			Mask: net.CIDRMask(maskLen, maskLen),
-		}
-		addr := &netlink.Addr{IPNet: ipn, Label: ""}
-		if err = netlink.AddrAdd(veth, addr); err != nil {
-			return fmt.Errorf("failed to add IP addr (%#v) to veth: %v", ipn, err)
-		}
+		err := netlink.RouteAdd(&netlink.Route{
+			LinkIndex: veth.Index,
+			Scope:     netlink.SCOPE_LINK,
+			Dst: &net.IPNet{
+				IP:   ipc.Address.IP,
+				Mask: net.CIDRMask(addrBits, addrBits),
+			},
+		})
 
-		ipn = &net.IPNet{
-			IP:   ipc.Address.IP,
-			Mask: net.CIDRMask(maskLen, maskLen),
+		if err != nil {
+			return fmt.Errorf("failed to add host route dst %v: %v", ipc.Address.IP, err)
 		}
-		// dst happens to be the same as IP/net of host veth
-		if err = ip.AddHostRoute(ipn, nil, veth); err != nil && !os.IsExist(err) {
-			return fmt.Errorf("failed to add route on host: %v", err)
+	}
+
+	// add policy rules for traffic coming in from Pods and destined for the VPC
+	//err = addPolicyRules(veth, result.IPs[0], result.Routes, tableStart)
+	//if err != nil {
+	//	return fmt.Errorf("failed to add policy rules: %v", err)
+	//}
+
+	// Send a gratuitous arp for all borrowed v4 addresses
+	for _, ipc := range hostAddrs {
+		if ipc.IP.To4() != nil {
+			_ = arping.GratuitousArpOverIface(ipc.IP, *veth)
 		}
 	}
 
 	return nil
 }
 
+// cmdAdd is called for ADD requests
 func cmdAdd(args *skel.CmdArgs) error {
-	conf := NetConf{}
-	if err := json.Unmarshal(args.StdinData, &conf); err != nil {
-		return fmt.Errorf("failed to load netconf: %v", err)
-	}
-
-	// run the IPAM plugin and get back the config to apply
-	r, err := ipam.ExecAdd(conf.IPAM.Type, args.StdinData)
-	if err != nil {
-		return err
-	}
-	// Convert whatever the IPAM result was into the current Result type
-	result, err := current.NewResultFromResult(r)
+	conf, err := parseConfig(args.StdinData)
 	if err != nil {
 		return err
 	}
 
-	if len(result.IPs) == 0 {
-		return errors.New("IPAM plugin returned missing IP config")
+	if conf.PrevResult == nil {
+		return fmt.Errorf("must be called as chained plugin")
 	}
 
-	if err := ip.EnableForward(result.IPs); err != nil {
-		return fmt.Errorf("Could not enable IP forwarding: %v", err)
+	// This is some sample code to generate the list of container-side IPs.
+	// We're casting the prevResult to a 0.3.0 response, which can also include
+	// host-side IPs (but doesn't when converted from a 0.2.0 response).
+	containerIPs := make([]net.IP, 0, len(conf.PrevResult.IPs))
+	if conf.CNIVersion != "0.3.1" {
+		for _, cip := range conf.PrevResult.IPs {
+			containerIPs = append(containerIPs, cip.Address.IP)
+		}
+	} else {
+		for _, cip := range conf.PrevResult.IPs {
+			//if cip.Interface == nil {
+			//	continue
+			//}
+			//intIdx := *cip.Interface
+			// Every IP is indexed in to the interfaces array, with "-1" standing
+			// for an unknown interface (which we'll assume to be Container-side
+			// Skip all IPs we know belong to an interface with the wrong name.
+			//if intIdx >= 0 && intIdx < len(conf.PrevResult.Interfaces) && conf.PrevResult.Interfaces[intIdx].Name != args.IfName {
+			//	continue
+			//}
+			containerIPs = append(containerIPs, cip.Address.IP)
+		}
+	}
+	if len(containerIPs) == 0 {
+		return fmt.Errorf("got no container IPs")
+	}
+
+	containerIPV4 := false
+	containerIPV6 := false
+	for _, ipc := range containerIPs {
+		if ipc.To4() != nil {
+			containerIPV4 = true
+		} else {
+			containerIPV6 = true
+		}
+	}
+
+	if err := enableForwarding(containerIPV4, containerIPV6); err != nil {
+		return err
+	}
+
+	iface, err := netlink.LinkByName(conf.HostInterface)
+	if err != nil {
+		return fmt.Errorf("failed to lookup %q: %v", conf.HostInterface, err)
+	}
+
+	hostAddrs, err := netlink.AddrList(iface, netlink.FAMILY_ALL)
+	if err != nil || len(hostAddrs) == 0 {
+		return fmt.Errorf("failed to get host IP addresses for %q: %v", iface, err)
 	}
 
 	netns, err := ns.GetNS(args.Netns)
@@ -217,38 +425,44 @@ func cmdAdd(args *skel.CmdArgs) error {
 	}
 	defer netns.Close()
 
-	hostInterface, containerInterface, err := setupContainerVeth(netns, args.IfName, conf.MTU, result)
+	hostInterface, _, err := setupContainerVeth(netns, conf.ContainerInterface, conf.MTU,
+		hostAddrs, conf.IPMasq, containerIPV4, containerIPV6, args.IfName, conf.PrevResult)
 	if err != nil {
 		return err
 	}
 
-	if err = setupHostVeth(hostInterface.Name, result); err != nil {
+	if err = setupHostVeth(hostInterface.Name, hostAddrs, conf.IPMasq, conf.TableStart, conf.PrevResult); err != nil {
 		return err
 	}
 
 	if conf.IPMasq {
+		err := enableForwarding(containerIPV4, containerIPV6)
+		if err != nil {
+			return err
+		}
+
 		chain := utils.FormatChainName(conf.Name, args.ContainerID)
 		comment := utils.FormatComment(conf.Name, args.ContainerID)
-		for _, ipc := range result.IPs {
-			if err = ip.SetupIPMasq(&ipc.Address, chain, comment); err != nil {
+		for _, ipc := range containerIPs {
+			addrBits := 128
+			if ipc.To4() != nil {
+				addrBits = 32
+			}
+
+			if err = ip.SetupIPMasq(&net.IPNet{IP: ipc, Mask: net.CIDRMask(addrBits, addrBits)}, chain, comment); err != nil {
 				return err
 			}
 		}
 	}
 
-	result.DNS = conf.DNS
-	result.Interfaces = []*current.Interface{hostInterface, containerInterface}
-
-	return types.PrintResult(result, conf.CNIVersion)
+	// Pass through the result for the next plugin
+	return types.PrintResult(conf.PrevResult, conf.CNIVersion)
 }
 
+// cmdDel is called for DELETE requests
 func cmdDel(args *skel.CmdArgs) error {
-	conf := NetConf{}
-	if err := json.Unmarshal(args.StdinData, &conf); err != nil {
-		return fmt.Errorf("failed to load netconf: %v", err)
-	}
-
-	if err := ipam.ExecDel(conf.IPAM.Type, args.StdinData); err != nil {
+	conf, err := parseConfig(args.StdinData)
+	if err != nil {
 		return err
 	}
 
@@ -260,7 +474,7 @@ func cmdDel(args *skel.CmdArgs) error {
 	// so don't return an error if the device is already removed.
 	// If the device isn't there then don't try to clean up IP masq either.
 	var ipnets []*net.IPNet
-	err := ns.WithNetNSPath(args.Netns, func(_ ns.NetNS) error {
+	err = ns.WithNetNSPath(args.Netns, func(_ ns.NetNS) error {
 		var err error
 		ipnets, err = ip.DelLinkByNameAddr(args.IfName)
 		if err != nil && err == ip.ErrLinkNotFound {
@@ -273,17 +487,23 @@ func cmdDel(args *skel.CmdArgs) error {
 		return err
 	}
 
-	if len(ipnets) != 0 && conf.IPMasq {
+	if conf.IPMasq {
 		chain := utils.FormatChainName(conf.Name, args.ContainerID)
 		comment := utils.FormatComment(conf.Name, args.ContainerID)
 		for _, ipn := range ipnets {
-			err = ip.TeardownIPMasq(ipn, chain, comment)
+			addrBits := 128
+			if ipn.IP.To4() != nil {
+				addrBits = 32
+			}
+
+			err = ip.TeardownIPMasq(&net.IPNet{IP: ipn.IP, Mask: net.CIDRMask(addrBits, addrBits)}, chain, comment)
 		}
 	}
 
-	return err
+	return nil
 }
 
 func main() {
+	rand.Seed(time.Now().UnixNano())
 	skel.PluginMain(cmdAdd, cmdDel, version.All)
 }
